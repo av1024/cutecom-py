@@ -1,0 +1,481 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import argparse
+import logging
+try:
+    import serial
+    from serial.tools.list_ports import comports
+except ImportError:
+    print >>sys.stderr, "PySerial required. Install it using `pip install pyserial`"
+    sys.exit(1)
+
+import sip
+sip.setapi("QString", 2)
+from PyQt4 import QtCore, QtGui, uic
+
+
+VERSION = "0.1"
+CUTECOM = "cutecom"
+if hasattr(sys, "frozen"):
+    APP_PATH = os.path.realpath(os.path.dirname(unicode(sys.executable, sys.getfilesystemencoding())))
+else:
+    APP_PATH = os.path.realpath(os.path.dirname(unicode(__file__, sys.getfilesystemencoding())))
+
+UI_NAME = os.path.join(APP_PATH, "cutecommdlg.ui")
+
+log = None
+
+class ComThread(QtCore.QThread):
+
+    dataReceived = QtCore.pyqtSignal('QByteArray')
+
+    def __init__(self, port, *args, **kwargs):
+        super(ComThread, self).__init__()
+        self.port = port
+        self.args = args
+        self.kwargs = kwargs
+        self._quit = False
+        log.debug("Init thread. Port: %s", self.port)
+
+    def __del__(self):
+        if self.port is not None:
+            try:
+                self.port.close()
+            except:
+                pass
+        self.wait()
+
+    @QtCore.pyqtSlot(str)
+    def send(self, sendstr):
+        """Slot to put string into port"""
+        log.debug("^^^ send str ^^^")
+
+    @QtCore.pyqtSlot()
+    def closePort(self):
+        """Close port and exit"""
+
+        self._quit = True
+
+    def run(self):
+
+        if self.port is None:
+            return
+
+        try:
+            self.port.open()
+        except:
+            log.exception("Serial open failed.")
+            return
+
+        while not self._quit:
+            try:
+                if self.port.inWaiting() > 0:
+                    buf = self.port.read(self.port.inWaiting())
+                    log.debug("RCV: '%r'", buf)
+                    s = QtCore.QByteArray.fromRawData(buf)
+                    self.dataReceived.emit(s)
+                self.msleep(10)
+
+            except:
+                log.exception("Serial thread error:")
+
+        if self.port is not None:
+            try:
+                self.port.close()
+            except:
+                pass
+        self.port = None
+        log.debug(" Com thread finished. ")
+
+
+
+
+class CuteCom(QtGui.QWidget):
+    def __init__(self, parent=None):
+        super(CuteCom, self).__init__(parent)
+
+        self.portName = ""
+        self.port = serial.Serial()
+        self.thr = None  #ComThread
+        self.settings = QtCore.QSettings(CUTECOM, CUTECOM, self)
+        self.logFile = None
+
+        # pre-GUI
+        self.init_translation()
+
+        # load UI
+        uic.loadUi(UI_NAME, self)
+
+        #self.connect(QtGui.qApp, QtCore.SIGNAL("Close"), self.onQuit)
+
+        # assign button handlers
+        self.m_quitPb.clicked.connect(self.onQuit)
+        self.m_aboutPb.clicked.connect(self.onAbout)
+        self.m_closePb.clicked.connect(self.onClose)
+        self.m_connectPb.clicked.connect(self.onOpen)
+
+        self.m_logFileFileDialog.clicked.connect(self.onLogFile)
+        self.m_sendPb.clicked.connect(self.onSendFile)
+
+        self.m_enableLoggingCb.toggled.connect(self.onCheckLogging)
+
+        # -- connected via .ui --
+        #self.m_clearOutputPb.clicked.connect(self.onClear)
+        #self.m_clearOldCmds.clicked.connect(self.m_clearOldCmds.clear())
+        #self.m_clearOldCmds.clicked.connect(self.m_cmdLe.clear())
+
+        self.m_cmdLe.returnPressed.connect(self.onSubmitStr)
+
+        # -- ui combo-boxes --
+        self.m_baudCb.clear()
+        self.m_baudCb.addItems([x[0] for x in self.port.getSupportedBaudrates()])
+        self.m_baudCb.setCurrentIndex(self.m_baudCb.findText("57600"))
+
+        self.m_dataBitsCb.clear()
+        self.m_dataBitsCb.addItems([x[0] for x in self.port.getSupportedByteSizes()])
+        self.m_dataBitsCb.setCurrentIndex(self.m_dataBitsCb.findText("8"))
+
+        self.m_deviceCb.keyPressEventOld = self.m_deviceCb.keyPressEvent
+        self.m_deviceCb.keyPressEvent = self.onKey
+
+        self.loadSettings()
+
+
+    def __del__(self):
+        log.debug("=== DELETED ===")
+        if self.port is not None:
+            try:
+                self.port.close()
+            except:
+                pass
+
+
+    def loadSettings(self):
+        log.debug("== loadSettings ==")
+
+        try:
+
+            # -- devices
+            ss = self.settings.value("AllDevices", "").toString().split(u",")
+            for pp in comports():
+                # tuple (name, description, HW id)
+                if (pp[1] is not None) and pp[1].startswith("ttyS") and (pp[2] == 'n/a'):
+                    # skip possibly fake serial ports
+                    continue
+                if pp[0] not in ss:
+                    ss.append(pp[0])
+            ss.sort()
+
+            for s in ss:
+                self.m_deviceCb.addItem(s)
+
+            self.m_deviceCb.setEditText(self.settings.value("CurrentDevice", "").toString())
+
+            # -- baudrate
+            self.m_baudCb.setCurrentIndex(self.m_baudCb.findText(
+                    self.settings.value("Baudrate", "115200").toString()))
+
+            # -- data bits
+            self.m_dataBitsCb.setCurrentIndex(self.m_dataBitsCb.findText(
+                    self.settings.value("ByteSize", "8").toString()))
+
+            # -- stop bits
+            self.m_stopCb.setCurrentIndex(self.m_stopCb.findText(
+                    self.settings.value("StopBits", "1").toString()))
+
+            # -- parity
+            self.m_parityCb.setCurrentIndex(self.m_parityCb.findText(
+                    self.settings.value("Parity", "None").toString()))
+
+            # -- logging to:
+            self.m_logAppendCb.setCurrentIndex(self.settings.value("LogAppend", 0).toInt()[0])
+            self.m_logFileLe.setText(self.settings.value("LogTo", "").toString())
+
+            # -- LF
+            self.m_inputModeCb.setCurrentIndex(self.settings.value("LFMode", 0).toInt()[0])
+
+            # -- char delay
+            self.m_charDelaySb.setValue(self.settings.value("CharDelay", 0).toInt()[0])
+
+            # -- checkboxes
+            for nm in ["m_softwareCb", "m_hardwareCb", "m_readCb", "m_writeCb", "m_applyCb",
+                       "m_hexOutputCb", "m_enableLoggingCb", "m_scrollCb"]:
+                cb = getattr(self, nm)
+                cb.setCheckState(self.settings.value(nm[2:-2], 0).toInt()[0])
+
+        except:
+            log.exception("Load settings fail:")
+
+    def storeSettings(self):
+        log.debug("== storeSettings ==")
+        try:
+
+            # -- port names --
+            s = []
+            for i in xrange(0, self.m_deviceCb.count()):
+                tmp = self.m_deviceCb.itemText(i)
+                if tmp:
+                    s.append(tmp)
+
+            if self.m_deviceCb.currentText() not in s:
+                s.append(self.m_deviceCb.currentText())
+
+            self.settings.setValue("AllDevices", u",".join(s))
+            self.settings.setValue("CurrentDevice", self.m_deviceCb.currentText())
+
+            # -- baudrate
+            self.settings.setValue("Baudrate", self.m_baudCb.currentText())
+            # -- data bits
+            self.settings.setValue("ByteSize", self.m_dataBitsCb.currentText())
+            # -- stop bits
+            self.settings.setValue("StopBits", self.m_stopCb.currentText())
+            # -- parity
+            self.settings.setValue("Parity", self.m_parityCb.currentText())
+
+            # -- logging to:
+            self.settings.setValue("LogAppend", self.m_logAppendCb.currentIndex())
+            self.settings.setValue("LogTo", self.m_logFileLe.text())
+
+            # -- LF
+            self.settings.setValue("LFMode", self.m_inputModeCb.currentIndex())
+
+            # -- char delay
+            self.settings.setValue("CharDelay", self.m_charDelaySb.value())
+
+            # -- checkboxes
+            for nm in ["m_softwareCb", "m_hardwareCb", "m_readCb", "m_writeCb", "m_applyCb",
+                       "m_hexOutputCb", "m_enableLoggingCb", "m_scrollCb"]:
+                cb = getattr(self, nm)
+                self.settings.setValue(nm[2:-2], cb.checkState())
+
+            self.settings.sync()
+        except:
+            log.exception("Save settings failed:")
+
+
+    def closeEvent(self, event):
+        self.onQuit()
+        event.accept()
+
+    # -- buttons --
+    def onQuit(self):
+        self.onClose()
+        try:
+            self.thr.closePort()
+            self.thr.wait()
+        except:
+            pass
+
+        self.storeSettings()
+        log.debug("**Quit**")
+        self.close()
+
+    def onOpen(self):
+        log.debug("**Open**")
+
+        self.portName = self.m_deviceCb.currentText()
+        self.port = serial.serial_for_url(self.portName, do_not_open=True)
+        if self.m_applyCb.isChecked():
+            self.port.baudrate = unicode(self.m_baudCb.currentText())
+            self.port.bytesize = int(unicode(self.m_dataBitsCb.currentText()))
+            self.port.parity = unicode(self.m_parityCb.currentText())[0]
+            self.port.stopbits = int(unicode(self.m_stopCb.currentText()))
+            self.port.xonxoff = self.m_softwareCb.isChecked()
+            self.port.rtscts = self.m_hardwareCb.isChecked()
+            if self.m_charDelaySb.value() != 0:
+                self.port.interCharTimeout = self.m_charDelaySb.value()
+            else:
+                self.port.interCharTimeout = None
+
+        log.debug("Thread init with port: %s", self.port)
+        self.thr = ComThread(self.port)
+        self.thr.dataReceived.connect(self.onDataReceived)
+        self.m_closePb.clicked.connect(self.thr.closePort)
+        self.thr.start()
+        # after success open...
+        self.enablePortUi(False)
+
+    def onClose(self):
+        log.debug("**Close**")
+        if self.logFile:
+            self.logFile.flush()
+        #try:
+        #    self.port.close()
+        #except:
+        #    pass
+        #self.port = None
+        #self.thr.terminate()
+        #self.thr = None
+
+        # after success close...
+        self.enablePortUi(True)
+
+    def onAbout(self):
+        log.debug("**About**")
+        QtGui.QMessageBox.about(self, u"CuteCom-py",
+            self.tr("""Re-implementation of orignal <b>CuteCom</b>
+            by Alexander Neundorf <neundorf@kde.org>.<br/>
+            Based on original UI file from <a href="http://cutecom.sourceforge.net">cutecom.sf.net</a>.<br/>
+            <br/>
+            Python code by Alexander Voronin <av1024@gmail.com><br/>
+            Homepage: http://github.com/av1024/cutecomm-py/
+            """))
+
+    def onClear(self):
+        log.debug("**Clear**")
+
+    def onLogFile(self):
+        log.debug("**LogFile**")
+        s = self.m_logFileLe.text()
+        s = QtGui.QFileDialog.getSaveFileName(self, self.tr("Save output to..."), s)
+        if s:
+            self.m_logFileLe.setText(s)
+
+    def onSendFile(self):
+        log.debug("**SendFile**")
+
+    def onClearCmds(self, ):
+        self.m_clearOldCmds.clear()
+
+
+    def onSubmitStr(self):
+        s = self.m_cmdLe.text()
+
+        ii = self.m_oldCmdsLb.findItems(s, QtCore.Qt.MatchFixedString | QtCore.Qt.MatchCaseSensitive)
+        if ii:
+            self.m_oldCmdsLb.setCurrentItem(ii[0])
+        else:
+            self.m_oldCmdsLb.insertItem(0, s)
+
+        log.debug(u"SUBMIT `%s`", s)
+
+    def onCheckLogging(self, allow):
+        """Checkbox 'Log to file' handler"""
+        log.debug(" -- LOG TO -->[%s]", allow)
+        if not allow:
+            if isinstance(self.logFile, QtCore.QFile):
+                self.logFile.close()
+        else:
+            s = self.m_logFileLe.text()
+            self.logFile = QtCore.QFile(s, self)
+
+            if self.m_logAppendCb.currentIndex()==0:
+                self.logFile.open(QtCore.QIODevice.WriteOnly|QtCore.QIODevice.Truncate)
+            else:
+                self.logFile.open(QtCore.QIODevice.WriteOnly|QtCore.QIODevice.Append)
+
+
+
+    # -- ui --
+    def enablePortUi(self, enable):
+        "Set UI elements state depend on open/closed port mode"
+
+        #TODO: add m_protoPb combo after protocol implementation
+        for objn in ["m_deviceCb", "m_baudCb", "m_dataBitsCb", "m_stopCb", "m_parityCb",
+                     "m_softwareCb", "m_hardwareCb", "m_readCb", "m_writeCb", "m_applyCb",
+                     "m_connectPb"]:
+            obj = getattr(self, objn)
+            obj.setEnabled(enable)
+
+        for objn in ["m_closePb", "m_cmdLe", "m_sendPb"]:
+            obj = getattr(self, objn)
+            obj.setEnabled(not enable)
+
+    def onKey(self, e):  # QtGui.QKeyEvent e
+        """Overriden method for device combo box.
+        Use <Ctrl>+<Delete> to remove current item from popup list
+        """
+
+        if e.key()==QtCore.Qt.Key_Delete and e.modifiers()==QtCore.Qt.ControlModifier:
+            log.debug("== Ctrl-Del ==")
+            i = self.m_deviceCb.findText(self.m_deviceCb.currentText())
+            if i >= 0:
+                self.m_deviceCb.removeItem(i)
+            self.m_deviceCb.setEditText("")
+            e.accept()
+        else:
+            e.ignore()
+            self.m_deviceCb.keyPressEventOld(e)
+
+    def onDataReceived(self, data):
+        """signal hander for ComThread.onDataReceived(QByteArray)
+        """
+        #log.debug("DATA: '%r'", data.data())
+        #s = data.replace('\x00', "\\x00")
+
+        s = data.data().replace('\x00', '\\x00')
+        #log.debug("S: %r", s)
+
+        self.m_outputView.insertPlainText("%s" % s)
+        if self.m_scrollCb.isChecked():
+            self.m_outputView.ensureCursorVisible()
+
+        if self.m_enableLoggingCb.isChecked() and self.logFile:
+            self.logFile.writeData(s)
+
+
+    def init_translation(self):
+        """Find and load translation files."""
+
+        self.lang = QtCore.QLocale.system().name()
+        self.qtTr = QtCore.QTranslator()
+        tpaths = [
+            '',
+            APP_PATH,
+            os.path.join(APP_PATH, u"translations"),
+            unicode(QtCore.QLibraryInfo.location(QtCore.QLibraryInfo.TranslationsPath)),
+            u"/usr/share/qt4/translations"
+        ]
+        if os.name == "nt":
+            try:
+                f = open(os.path.join(sys.exec_prefix, "qt.conf"), "rt")
+                for s in f:
+                    if s.startswith("Prefix"):
+                        s = s.split("=", 1)[1].strip()
+                        tpaths.append(os.path.join(unicode(s, sys.getdefaultencoding(), "replace"), u"translations"))
+                        break
+                f.close()
+            except:
+                pass
+
+        for p in tpaths:
+            if self.qtTr.load(os.path.join(p, u"qt_%s.qm" % (self.lang,))):
+                QtGui.qApp.installTranslator(self.qtTr)
+                break
+        else:
+            log.warning("Error loading Qt translations for %s locale" % (self.lang,))
+
+        self.appTr = QtCore.QTranslator()
+        if self.appTr.load("%s_%s.qm" % (CUTECOM, self.lang)):
+            QtGui.qApp.installTranslator(self.appTr)
+
+        #tt = QtCore.QTranslator()
+        #for m in self.plug_modules:
+        #    if tt.load(os.path.join(m.__path__[0], 'translate_%s.qm' % (self.lang,))):
+        #        self._plug_trans.append(tt) # reference store
+        #        QtGui.qApp.installTranslator(tt)
+        #        tt = QtCore.QTranslator()
+
+
+
+def main():
+
+    app = QtGui.QApplication(sys.argv)
+
+    w = CuteCom();
+    w.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    log = logging.getLogger('cutecom')
+    try:
+        from utils import setupcon
+        #setupcon.
+    except:
+        logging.basicConfig()
+        log.setLevel(logging.DEBUG)
+
+    main()
